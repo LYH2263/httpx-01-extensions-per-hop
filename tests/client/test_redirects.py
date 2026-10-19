@@ -445,3 +445,209 @@ async def test_async_invalid_redirect():
             await client.get(
                 "http://example.org/invalid_redirect", follow_redirects=True
             )
+
+
+def recording_redirect_handler(seen):
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Record the per-hop extensions *before* the transport writes into
+        # them, exactly like a trace callback or transport might do.
+        seen.append((request.url.path, request.extensions, set(request.extensions)))
+        request.extensions["transport_write"] = request.url.path
+        if request.url.path == "/redirect_302":
+            return httpx.Response(
+                httpx.codes.FOUND,
+                headers={"location": "https://example.org/target"},
+                extensions={"response_ext": request.url.path},
+            )
+        return httpx.Response(
+            httpx.codes.OK,
+            extensions={"response_ext": request.url.path},
+        )
+
+    return handler
+
+
+def test_redirect_extensions_are_copied_per_hop():
+    seen = []
+    client = httpx.Client(transport=httpx.MockTransport(recording_redirect_handler(seen)))
+    response = client.get(
+        "https://example.org/redirect_302",
+        follow_redirects=True,
+        extensions={"sentinel": "value"},
+    )
+    assert response.status_code == httpx.codes.OK
+
+    # Two hops, each with its very own extensions dict.
+    assert [path for path, _, _ in seen] == ["/redirect_302", "/target"]
+    assert seen[0][1] is not seen[1][1]
+
+    # Each hop sees the caller-provided content plus the timeout, with no
+    # writes from an earlier hop leaking into a later one.
+    for _, _, keys in seen:
+        assert {"sentinel", "timeout"} <= keys
+        assert "transport_write" not in keys
+    assert seen[0][1]["transport_write"] == "/redirect_302"
+    assert seen[1][1]["transport_write"] == "/target"
+
+
+def test_redirect_extensions_restore_callers_dict():
+    seen = []
+    client = httpx.Client(transport=httpx.MockTransport(recording_redirect_handler(seen)))
+    caller_extensions = {"sentinel": "value"}
+    request = client.build_request(
+        "GET", "https://example.org/redirect_302", extensions=caller_extensions
+    )
+    request_extensions = request.extensions
+
+    response = client.send(request, follow_redirects=True)
+    assert response.status_code == httpx.codes.OK
+
+    # The request the caller built keeps exactly the dict it started with,
+    # and the dict the caller passed in is unchanged in keys and values.
+    assert request.extensions is request_extensions
+    assert caller_extensions == {"sentinel": "value"}
+    assert "transport_write" not in request.extensions
+
+
+def test_redirect_extensions_response_dicts_are_distinct():
+    seen = []
+    client = httpx.Client(transport=httpx.MockTransport(recording_redirect_handler(seen)))
+    response = client.get(
+        "https://example.org/redirect_302",
+        follow_redirects=True,
+        extensions={"sentinel": "value"},
+    )
+
+    # Response extensions must never be the request's dict, and every hop's
+    # response gets its own extensions dict.
+    assert response.extensions is not response.request.extensions
+    assert response.extensions == {"response_ext": "/target"}
+    assert len(response.history) == 1
+    hop_response = response.history[0]
+    assert hop_response.extensions is not hop_response.request.extensions
+    assert hop_response.extensions == {"response_ext": "/redirect_302"}
+    assert hop_response.extensions is not response.extensions
+
+
+def test_next_request_extensions_are_pristine_copy():
+    seen = []
+    client = httpx.Client(transport=httpx.MockTransport(recording_redirect_handler(seen)))
+    caller_extensions = {"sentinel": "value"}
+    request = client.build_request(
+        "GET", "https://example.org/redirect_302", extensions=caller_extensions
+    )
+    response = client.send(request, follow_redirects=False)
+
+    next_request = response.next_request
+    assert next_request is not None
+    assert next_request.extensions is not request.extensions
+    assert next_request.extensions is not seen[0][1]
+    assert next_request.extensions.get("sentinel") == "value"
+    assert "transport_write" not in next_request.extensions
+    assert caller_extensions == {"sentinel": "value"}
+
+    # The exposed next request can be sent and gets its own fresh dict.
+    follow_up = client.send(next_request, follow_redirects=False)
+    assert follow_up.status_code == httpx.codes.OK
+    assert follow_up.next_request is None
+
+
+@pytest.mark.anyio
+async def test_async_redirect_extensions_are_copied_per_hop():
+    seen = []
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(recording_redirect_handler(seen))
+    ) as client:
+        response = await client.get(
+            "https://example.org/redirect_302",
+            follow_redirects=True,
+            extensions={"sentinel": "value"},
+        )
+
+    assert response.status_code == httpx.codes.OK
+    assert [path for path, _, _ in seen] == ["/redirect_302", "/target"]
+    assert seen[0][1] is not seen[1][1]
+    for _, _, keys in seen:
+        assert {"sentinel", "timeout"} <= keys
+        assert "transport_write" not in keys
+    assert seen[0][1]["transport_write"] == "/redirect_302"
+    assert seen[1][1]["transport_write"] == "/target"
+    assert response.extensions is not response.request.extensions
+
+
+@pytest.mark.anyio
+async def test_async_redirect_extensions_restore_callers_dict():
+    seen = []
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(recording_redirect_handler(seen))
+    ) as client:
+        caller_extensions = {"sentinel": "value"}
+        request = client.build_request(
+            "GET", "https://example.org/redirect_302", extensions=caller_extensions
+        )
+        request_extensions = request.extensions
+        response = await client.send(request, follow_redirects=True)
+
+    assert response.status_code == httpx.codes.OK
+    assert request.extensions is request_extensions
+    assert caller_extensions == {"sentinel": "value"}
+    assert "transport_write" not in request.extensions
+
+
+@pytest.mark.anyio
+async def test_async_next_request_extensions_are_pristine_copy():
+    seen = []
+    caller_extensions = {"sentinel": "value"}
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(recording_redirect_handler(seen))
+    ) as client:
+        request = client.build_request(
+            "GET", "https://example.org/redirect_302", extensions=caller_extensions
+        )
+        response = await client.send(request, follow_redirects=False)
+
+        next_request = response.next_request
+        assert next_request is not None
+        assert next_request.extensions is not request.extensions
+        assert "transport_write" not in next_request.extensions
+        assert next_request.extensions.get("sentinel") == "value"
+
+        follow_up = await client.send(next_request, follow_redirects=False)
+        assert follow_up.status_code == httpx.codes.OK
+
+    assert caller_extensions == {"sentinel": "value"}
+
+
+@pytest.mark.anyio
+async def test_async_concurrent_requests_get_independent_extensions():
+    # Two in-flight requests sharing the same caller-provided dict must each
+    # send with their own extensions dicts, on every hop.
+    import anyio
+
+    seen_a = []
+    seen_b = []
+    transport_a = httpx.MockTransport(recording_redirect_handler(seen_a))
+    transport_b = httpx.MockTransport(recording_redirect_handler(seen_b))
+    caller_extensions = {"sentinel": "value"}
+
+    async with httpx.AsyncClient(transport=transport_a) as client_a:
+        async with httpx.AsyncClient(transport=transport_b) as client_b:
+            async with anyio.create_task_group() as tg:
+
+                async def make_request(client, seen):
+                    response = await client.get(
+                        "https://example.org/redirect_302",
+                        follow_redirects=True,
+                        extensions=caller_extensions,
+                    )
+                    assert response.status_code == httpx.codes.OK
+
+                tg.start_soon(make_request, client_a, seen_a)
+                tg.start_soon(make_request, client_b, seen_b)
+
+    all_dicts = [ext for _, ext, _ in seen_a + seen_b]
+    assert len(all_dicts) == 4
+    assert len({id(ext) for ext in all_dicts}) == 4
+    for _, _, keys in seen_a + seen_b:
+        assert "transport_write" not in keys
+    assert caller_extensions == {"sentinel": "value"}

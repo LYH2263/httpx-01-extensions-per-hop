@@ -244,7 +244,10 @@ class HTTPTransport(BaseTransport):
             ),
             headers=request.headers.raw,
             content=request.stream,
-            extensions=request.extensions,
+            # httpcore stores the extensions dict by reference, so hand it a
+            # private copy. Anything httpcore or the trace callback writes
+            # must not be visible on the httpx request or on later hops.
+            extensions=dict(request.extensions),
         )
         with map_httpcore_exceptions():
             resp = self._pool.handle_request(req)
@@ -388,7 +391,10 @@ class AsyncHTTPTransport(AsyncBaseTransport):
             ),
             headers=request.headers.raw,
             content=request.stream,
-            extensions=request.extensions,
+            # httpcore stores the extensions dict by reference, so hand it a
+            # private copy. Anything httpcore or the trace callback writes
+            # must not be visible on the httpx request or on later hops.
+            extensions=dict(request.extensions),
         )
         with map_httpcore_exceptions():
             resp = await self._pool.handle_async_request(req)

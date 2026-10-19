@@ -373,3 +373,28 @@ async def test_server_extensions(server):
         response = await client.get(url)
     assert response.status_code == 200
     assert response.extensions["http_version"] == b"HTTP/1.1"
+
+
+@pytest.mark.anyio
+async def test_per_hop_trace_extensions(server):
+    # The trace callback must run once per actually-sent request, seeing the
+    # request object belonging to that specific hop.
+    seen_requests = []
+
+    async def trace(name, info):
+        if name.endswith("send_request_headers.started"):
+            seen_requests.append(info["request"])
+
+    extensions = {"trace": trace}
+    async with httpx.AsyncClient() as client:
+        url = server.url.copy_with(path="/redirect_301")
+        response = await client.get(
+            url, follow_redirects=True, extensions=extensions
+        )
+    assert response.status_code == 200
+    assert len(seen_requests) == 2
+    assert seen_requests[0] is not seen_requests[1]
+    assert seen_requests[0].url.target == b"/redirect_301"
+    assert seen_requests[1].url.target == b"/"
+    # The caller's dict is untouched.
+    assert extensions == {"trace": trace}

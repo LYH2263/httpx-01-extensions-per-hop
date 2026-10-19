@@ -407,6 +407,30 @@ def test_server_extensions(server):
     assert response.extensions["http_version"] == b"HTTP/1.1"
 
 
+def test_per_hop_trace_extensions(server):
+    # The trace callback must run once per actually-sent request, seeing the
+    # request object belonging to that specific hop.
+    seen_requests = []
+
+    def trace(name, info):
+        if name.endswith("send_request_headers.started"):
+            seen_requests.append(info["request"])
+
+    extensions = {"trace": trace}
+    with httpx.Client() as client:
+        url = server.url.copy_with(path="/redirect_301")
+        response = client.get(
+            url, follow_redirects=True, extensions=extensions
+        )
+    assert response.status_code == 200
+    assert len(seen_requests) == 2
+    assert seen_requests[0] is not seen_requests[1]
+    assert seen_requests[0].url.target == b"/redirect_301"
+    assert seen_requests[1].url.target == b"/"
+    # The caller's dict is untouched.
+    assert extensions == {"trace": trace}
+
+
 def test_client_decode_text_using_autodetect():
     # Ensure that a 'default_encoding=autodetect' on the response allows for
     # encoding autodetection to be used when no "Content-Type: text/plain; charset=..."

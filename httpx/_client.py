@@ -967,36 +967,54 @@ class Client(BaseClient):
         follow_redirects: bool,
         history: list[Response],
     ) -> Response:
-        while True:
-            if len(history) > self.max_redirects:
-                raise TooManyRedirects(
-                    "Exceeded maximum allowed redirects.", request=request
-                )
+        # Every request that actually gets sent carries its own fresh copy of
+        # the caller's extensions, with another copy for each redirect hop.
+        # This keeps anything the transport (eg. the trace callback) writes
+        # into the extensions local to that single hop, instead of leaking
+        # onto later hops, other overlapping requests, or the caller's dict.
+        original_request = request
+        original_extensions = request.extensions
+        try:
+            while True:
+                if len(history) > self.max_redirects:
+                    raise TooManyRedirects(
+                        "Exceeded maximum allowed redirects.", request=request
+                    )
 
-            for hook in self._event_hooks["request"]:
-                hook(request)
+                request.extensions = dict(original_extensions)
 
-            response = self._send_single_request(request)
-            try:
-                for hook in self._event_hooks["response"]:
-                    hook(response)
-                response.history = list(history)
+                for hook in self._event_hooks["request"]:
+                    hook(request)
 
-                if not response.has_redirect_location:
-                    return response
+                response = self._send_single_request(request)
+                try:
+                    for hook in self._event_hooks["response"]:
+                        hook(response)
+                    response.history = list(history)
 
-                request = self._build_redirect_request(request, response)
-                history = history + [response]
+                    if not response.has_redirect_location:
+                        return response
 
-                if follow_redirects:
-                    response.read()
-                else:
-                    response.next_request = request
-                    return response
+                    request = self._build_redirect_request(request, response)
+                    history = history + [response]
 
-            except BaseException as exc:
-                response.close()
-                raise exc
+                    if follow_redirects:
+                        response.read()
+                    else:
+                        # The exposed `next_request` also gets its own copy,
+                        # taken from the caller's original extensions rather
+                        # than from anything written during the last hop.
+                        request.extensions = dict(original_extensions)
+                        response.next_request = request
+                        return response
+
+                except BaseException as exc:
+                    response.close()
+                    raise exc
+        finally:
+            # Restore the request the caller handed us, so the extensions it
+            # ends up with are exactly the ones it started this call with.
+            original_request.extensions = original_extensions
 
     def _send_single_request(self, request: Request) -> Response:
         """
@@ -1682,37 +1700,55 @@ class AsyncClient(BaseClient):
         follow_redirects: bool,
         history: list[Response],
     ) -> Response:
-        while True:
-            if len(history) > self.max_redirects:
-                raise TooManyRedirects(
-                    "Exceeded maximum allowed redirects.", request=request
-                )
+        # Every request that actually gets sent carries its own fresh copy of
+        # the caller's extensions, with another copy for each redirect hop.
+        # This keeps anything the transport (eg. the trace callback) writes
+        # into the extensions local to that single hop, instead of leaking
+        # onto later hops, other overlapping requests, or the caller's dict.
+        original_request = request
+        original_extensions = request.extensions
+        try:
+            while True:
+                if len(history) > self.max_redirects:
+                    raise TooManyRedirects(
+                        "Exceeded maximum allowed redirects.", request=request
+                    )
 
-            for hook in self._event_hooks["request"]:
-                await hook(request)
+                request.extensions = dict(original_extensions)
 
-            response = await self._send_single_request(request)
-            try:
-                for hook in self._event_hooks["response"]:
-                    await hook(response)
+                for hook in self._event_hooks["request"]:
+                    await hook(request)
 
-                response.history = list(history)
+                response = await self._send_single_request(request)
+                try:
+                    for hook in self._event_hooks["response"]:
+                        await hook(response)
 
-                if not response.has_redirect_location:
-                    return response
+                    response.history = list(history)
 
-                request = self._build_redirect_request(request, response)
-                history = history + [response]
+                    if not response.has_redirect_location:
+                        return response
 
-                if follow_redirects:
-                    await response.aread()
-                else:
-                    response.next_request = request
-                    return response
+                    request = self._build_redirect_request(request, response)
+                    history = history + [response]
 
-            except BaseException as exc:
-                await response.aclose()
-                raise exc
+                    if follow_redirects:
+                        await response.aread()
+                    else:
+                        # The exposed `next_request` also gets its own copy,
+                        # taken from the caller's original extensions rather
+                        # than from anything written during the last hop.
+                        request.extensions = dict(original_extensions)
+                        response.next_request = request
+                        return response
+
+                except BaseException as exc:
+                    await response.aclose()
+                    raise exc
+        finally:
+            # Restore the request the caller handed us, so the extensions it
+            # ends up with are exactly the ones it started this call with.
+            original_request.extensions = original_extensions
 
     async def _send_single_request(self, request: Request) -> Response:
         """
